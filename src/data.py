@@ -53,7 +53,7 @@ def _import_alpaca_market_data() -> tuple[Any, Any, Any, Any, Any]:
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "distributional_rl.data requires alpaca-py for Alpaca market data "
+            "src.data requires alpaca-py for Alpaca market data "
             "retrieval. Install project dependencies with `pip install -e .`."
         ) from exc
 

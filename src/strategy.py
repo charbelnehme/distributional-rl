@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from distributional_rl.metrics import adjusted_sharpe_ratio, max_drawdown
-from distributional_rl.model import DistributionalModel
+from .metrics import adjusted_sharpe_ratio, max_drawdown
+from .model import DistributionalModel
 
 
 def _sample_distribution(dist_obj: object, n_samples: int) -> np.ndarray:

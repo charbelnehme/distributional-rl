@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from distributional_rl.data import AlpacaMarketDataStore, build_feature_dataset
+from src.data import AlpacaMarketDataStore, build_feature_dataset
 from tests.fixtures import make_sample_bars
 
 

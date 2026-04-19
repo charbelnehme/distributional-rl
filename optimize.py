@@ -7,9 +7,9 @@ from pathlib import Path
 import numpy as np
 import optuna
 
-from distributional_rl.data import AlpacaMarketDataStore, build_feature_dataset
-from distributional_rl.metrics import adjusted_sharpe_ratio
-from distributional_rl.strategy import DistributionalStrategy
+from src.data import AlpacaMarketDataStore, build_feature_dataset
+from src.metrics import adjusted_sharpe_ratio
+from src.strategy import DistributionalStrategy
 
 
 def load_training_data(

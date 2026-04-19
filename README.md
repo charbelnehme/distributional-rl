@@ -47,7 +47,7 @@ python3 -m pytest -q
 ```python
 from datetime import datetime, timezone
 
-from distributional_rl import AlpacaMarketDataStore, DistributionalStrategy, build_feature_dataset
+from src import AlpacaMarketDataStore, DistributionalStrategy, build_feature_dataset
 
 store = AlpacaMarketDataStore()
 bars = store.download_stock_bars(
@@ -69,8 +69,8 @@ print(positions)
 
 ## Project layout
 
-- `distributional_rl/data.py`: Alpaca retrieval, parquet storage, and feature engineering
-- `distributional_rl/model.py`: NGBoost model wrapper
-- `distributional_rl/metrics.py`: risk metric calculation
-- `distributional_rl/strategy.py`: position sizing logic
+- `src/data.py`: Alpaca retrieval, parquet storage, and feature engineering
+- `src/model.py`: NGBoost model wrapper
+- `src/metrics.py`: risk metric calculation
+- `src/strategy.py`: position sizing logic
 - `tests/`: unit tests

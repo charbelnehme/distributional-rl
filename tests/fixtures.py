@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from distributional_rl.data import build_feature_dataset
+from src.data import build_feature_dataset
 
 
 def make_sample_bars(symbol: str = "AAPL", periods: int = 80) -> pd.DataFrame:
