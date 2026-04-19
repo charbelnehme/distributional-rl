@@ -1,6 +1,6 @@
 import unittest
 
-from distributional_rl.model import DistributionalModel
+from src.model import DistributionalModel
 from tests.fixtures import make_training_frame
 
 

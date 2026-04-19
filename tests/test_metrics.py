@@ -1,6 +1,6 @@
 import numpy as np
 import unittest
-from distributional_rl.metrics import adjusted_sharpe_ratio, max_drawdown, sharpe_ratio, sortino_ratio
+from src.metrics import adjusted_sharpe_ratio, max_drawdown, sharpe_ratio, sortino_ratio
 
 class TestMetrics(unittest.TestCase):
     def test_normal_distribution(self):

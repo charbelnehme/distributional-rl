@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from distributional_rl.data import AlpacaMarketDataStore
+from src.data import AlpacaMarketDataStore
 from optimize import load_training_data, make_objective
 from tests.fixtures import make_sample_bars
 

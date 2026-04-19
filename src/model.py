@@ -4,7 +4,7 @@ try:
     from ngboost.scores import LogScore
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
-        "distributional_rl.model requires the optional dependency set for model "
+        "src.model requires the optional dependency set for model "
         "training. Install the project dependencies with `pip install -e .` "
         "or `pip install -e .[test]`."
     ) from exc

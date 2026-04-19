@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from distributional_rl.strategy import DistributionalStrategy, find_optimal_position
+from src.strategy import DistributionalStrategy, find_optimal_position
 from tests.fixtures import make_training_frame
 
 

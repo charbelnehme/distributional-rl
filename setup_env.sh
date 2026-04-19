@@ -40,6 +40,15 @@ fi
 
 "${VENV_DIR}/bin/python" -m pip install -e . --no-deps --no-build-isolation
 
+"${VENV_DIR}/bin/python" - <<'PY'
+import src
+from src import AlpacaMarketDataStore, DistributionalStrategy, build_feature_dataset
+
+assert src.AlpacaMarketDataStore is AlpacaMarketDataStore
+assert src.DistributionalStrategy is DistributionalStrategy
+assert src.build_feature_dataset is build_feature_dataset
+PY
+
 cat <<EOF
 Environment setup complete.
 Activate it with:
