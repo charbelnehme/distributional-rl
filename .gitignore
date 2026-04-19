@@ -1,0 +1,35 @@
+# Secrets
+.env
+
+# Local Python environment
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Alpaca and other fetched market data
+/data/
+/alpaca_data/
+/market_data/
+/cache/alpaca/
+/tmp/alpaca/
+
+# Common local outputs for downloaded market datasets
+data/**/*.csv
+data/**/*.json
+data/**/*.jsonl
+data/**/*.parquet
+data/**/*.feather
+data/**/*.pkl
+alpaca_data/**/*.csv
+alpaca_data/**/*.json
+alpaca_data/**/*.jsonl
+alpaca_data/**/*.parquet
+alpaca_data/**/*.feather
+alpaca_data/**/*.pkl
+market_data/**/*.csv
+market_data/**/*.json
+market_data/**/*.jsonl
+market_data/**/*.parquet
+market_data/**/*.feather
+market_data/**/*.pkl

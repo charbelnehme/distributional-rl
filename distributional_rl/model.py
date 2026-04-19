@@ -1,6 +1,13 @@
-from ngboost import NGBRegressor
-from ngboost.distns import Normal, T
-from ngboost.scores import LogScore
+try:
+    from ngboost import NGBRegressor
+    from ngboost.distns import Normal, T
+    from ngboost.scores import LogScore
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "distributional_rl.model requires the optional dependency set for model "
+        "training. Install the project dependencies with `pip install -e .` "
+        "or `pip install -e .[test]`."
+    ) from exc
 
 class DistributionalModel:
     def __init__(self, dist_name='Normal', n_estimators=100, learning_rate=0.01):

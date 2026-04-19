@@ -1,57 +1,85 @@
+from __future__ import annotations
+
 import numpy as np
 import scipy.stats as stats
 
-def adjusted_sharpe_ratio(returns):
-    """
-    Calculates the Adjusted Sharpe Ratio using the Pezier-White approximation.
-    
-    ASR = SR * [1 + (S/6)*SR - ((K-3)/24)*SR^2]
-    
-    Where:
-    SR = Annualized Sharpe Ratio
-    S = Skewness
-    K = Kurtosis (Fisher)
-    
-    Args:
-        returns (np.array): Array of returns (usually excess returns).
-    
-    Returns:
-        float: The adjusted Sharpe ratio.
-    """
-    if len(returns) < 2:
+
+def _coerce_returns(returns: np.ndarray | list[float]) -> np.ndarray:
+    values = np.asarray(returns, dtype=float).reshape(-1)
+    values = values[np.isfinite(values)]
+    return values
+
+
+def sharpe_ratio(returns: np.ndarray | list[float], risk_free_rate: float = 0.0) -> float:
+    values = _coerce_returns(returns)
+    if values.size < 2:
         return 0.0
-    
-    # Calculate moments
-    mean = np.mean(returns)
-    std = np.std(returns)
-    
-    if std == 0:
+
+    excess_returns = values - risk_free_rate
+    volatility = np.std(excess_returns, ddof=0)
+    if np.isclose(volatility, 0.0):
         return 0.0
-        
-    sr = mean / std
-    
-    # Skewness
-    s = stats.skew(returns)
-    
-    # Kurtosis (Fisher, so normal is 0. Scipy defaults to Fisher=True but let's be explicit)
-    # stats.kurtosis returns excess kurtosis (K - 3) by default.
-    # Pezier-White formula uses K (raw kurtosis) or K-3 (excess kurtosis)?
-    # The formula usually cited is:
-    # ASR = SR * (1 + (S/6) * SR - ((K-3)/24) * SR^2)
-    # where K is raw kurtosis. So (K-3) is excess kurtosis.
-    # stats.kurtosis returns excess kurtosis.
-    excess_k = stats.kurtosis(returns)
-    
-    # Adjustment
-    adjustment = 1 + (s / 6.0) * sr - (excess_k / 24.0) * (sr ** 2)
-    
-    asr = sr * adjustment
-    
-    # Annualize? Usually Sharpe is annualized. 
-    # But since we are comparing positions on the same timeframe, raw ASR is fine.
-    # The prompt implies maximizing "expected adjusted Sharpe ratio" of next period returns,
-    # or the simulated portfolio return series.
-    # If the simulation is over N samples (drawn from distribution), it represents the distribution of outcomes.
-    # So we calculate ASR of this distribution.
-    
-    return asr
+    return float(np.mean(excess_returns) / volatility)
+
+
+def downside_deviation(
+    returns: np.ndarray | list[float],
+    target_return: float = 0.0,
+) -> float:
+    values = _coerce_returns(returns)
+    if values.size == 0:
+        return 0.0
+
+    downside = np.minimum(values - target_return, 0.0)
+    return float(np.sqrt(np.mean(np.square(downside))))
+
+
+def sortino_ratio(
+    returns: np.ndarray | list[float],
+    target_return: float = 0.0,
+) -> float:
+    values = _coerce_returns(returns)
+    if values.size < 2:
+        return 0.0
+
+    dd = downside_deviation(values, target_return=target_return)
+    if np.isclose(dd, 0.0):
+        return 0.0
+    return float((np.mean(values) - target_return) / dd)
+
+
+def max_drawdown(returns: np.ndarray | list[float]) -> float:
+    values = _coerce_returns(returns)
+    if values.size == 0:
+        return 0.0
+
+    equity_curve = np.cumprod(1.0 + values)
+    running_peak = np.maximum.accumulate(equity_curve)
+    drawdowns = (equity_curve / running_peak) - 1.0
+    return float(drawdowns.min())
+
+
+def adjusted_sharpe_ratio(returns: np.ndarray | list[float]) -> float:
+    """
+    Pezier-White adjusted Sharpe ratio:
+
+        ASR = SR * (1 + (S / 6) * SR - (K_excess / 24) * SR^2)
+    """
+
+    values = _coerce_returns(returns)
+    if values.size < 2:
+        return 0.0
+
+    sr = sharpe_ratio(values)
+    if np.isclose(sr, 0.0):
+        return 0.0
+
+    skew = float(stats.skew(values, bias=False))
+    excess_kurtosis = float(stats.kurtosis(values, fisher=True, bias=False))
+    if not np.isfinite(skew):
+        skew = 0.0
+    if not np.isfinite(excess_kurtosis):
+        excess_kurtosis = 0.0
+
+    adjustment = 1.0 + (skew / 6.0) * sr - (excess_kurtosis / 24.0) * (sr**2)
+    return float(sr * adjustment)

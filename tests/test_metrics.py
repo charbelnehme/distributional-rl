@@ -1,7 +1,6 @@
 import numpy as np
-import scipy.stats as stats
 import unittest
-from distributional_rl.metrics import adjusted_sharpe_ratio
+from distributional_rl.metrics import adjusted_sharpe_ratio, max_drawdown, sharpe_ratio, sortino_ratio
 
 class TestMetrics(unittest.TestCase):
     def test_normal_distribution(self):
@@ -10,7 +9,7 @@ class TestMetrics(unittest.TestCase):
         np.random.seed(42)
         returns = np.random.normal(0.01, 0.02, 10000)
         
-        sr = np.mean(returns) / np.std(returns)
+        sr = sharpe_ratio(returns)
         asr = adjusted_sharpe_ratio(returns)
         
         self.assertAlmostEqual(sr, asr, places=2)
@@ -21,13 +20,13 @@ class TestMetrics(unittest.TestCase):
         # LogNormal is positively skewed
         returns = np.random.lognormal(0, 0.5, 10000) - np.exp(0.5**2 / 2) + 0.05 # Centered + drift
         
-        sr = np.mean(returns) / np.std(returns)
         asr = adjusted_sharpe_ratio(returns)
-        
-        # S > 0, so ASR > SR assuming SR > 0 and K term doesn't dominate
-        # Actually K term is negative, so high kurtosis reduces it.
-        # Let's just check it runs and returns a float.
         self.assertIsInstance(asr, float)
+
+    def test_sortino_and_drawdown(self):
+        returns = np.array([0.01, -0.02, 0.015, -0.01, 0.005])
+        self.assertIsInstance(sortino_ratio(returns), float)
+        self.assertLessEqual(max_drawdown(returns), 0.0)
 
 if __name__ == '__main__':
     unittest.main()
