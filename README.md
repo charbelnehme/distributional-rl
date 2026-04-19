@@ -17,8 +17,6 @@ This checkout contains:
 - a distributional position-sizing strategy
 - unit tests for the above
 
-It still does **not** contain live trading, streaming, or order book handling.
-
 ## Installation
 
 Use Python 3.10+.
