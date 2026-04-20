@@ -217,7 +217,8 @@ def build_feature_dataset(
     volatility_window: int = 20,
     atr_window: int = 14,
     volume_window: int = 20,
-) -> tuple[pd.DataFrame, pd.Series]:
+    return_metadata: bool = False,
+) -> tuple[pd.DataFrame, pd.Series] | tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     required_columns = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
     missing = required_columns.difference(bars.columns)
     if missing:
@@ -292,6 +293,9 @@ def build_feature_dataset(
         ]
     ].reset_index(drop=True)
     target = dataset["target_return"].rename("excess_return").reset_index(drop=True)
+    if return_metadata:
+        metadata = dataset[["timestamp", "symbol"]].reset_index(drop=True)
+        return features, target, metadata
     return features, target
 
 
