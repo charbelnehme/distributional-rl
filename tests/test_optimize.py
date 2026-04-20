@@ -9,7 +9,6 @@ import pandas as pd
 import optimize
 from optimize import (
     OptimizationConfig,
-    TrainingDataset,
     ValidationConfig,
     _build_walk_forward_folds,
     load_training_data,
@@ -17,6 +16,7 @@ from optimize import (
     parse_utc_datetime,
     run_optimization,
 )
+from src.data import FeatureDataset
 from src.data import AlpacaMarketDataStore
 from tests.fixtures import make_sample_bars
 
@@ -63,7 +63,7 @@ class TestOptimize(unittest.TestCase):
     def tearDown(self):
         optimize.DistributionalStrategy = self._original_strategy
 
-    def _make_dataset(self, tmpdir: str, *, multi_symbol: bool = False) -> TrainingDataset:
+    def _make_dataset(self, tmpdir: str, *, multi_symbol: bool = False) -> FeatureDataset:
         store = AlpacaMarketDataStore(storage_root=tmpdir)
         bars = make_sample_bars(periods=80)
         if multi_symbol:
@@ -77,14 +77,13 @@ class TestOptimize(unittest.TestCase):
             end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
             storage_root=Path(tmpdir),
             download=False,
-            return_metadata=True,
         )
 
     def test_load_training_data_returns_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dataset = self._make_dataset(tmpdir)
 
-            self.assertIsInstance(dataset, TrainingDataset)
+            self.assertIsInstance(dataset, FeatureDataset)
             self.assertFalse(dataset.features.empty)
             self.assertEqual(len(dataset.features), len(dataset.target))
             self.assertEqual(len(dataset.features), len(dataset.metadata))
@@ -190,3 +189,4 @@ class TestOptimize(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
