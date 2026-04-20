@@ -1,32 +1,62 @@
-import numpy as np
+from __future__ import annotations
+
 import unittest
-from src.metrics import adjusted_sharpe_ratio, max_drawdown, sharpe_ratio, sortino_ratio
+
+import numpy as np
+
+from src.metrics import (
+    ReturnKind,
+    adjusted_sharpe_ratio,
+    max_drawdown,
+    sharpe_ratio,
+    sortino_ratio,
+)
+
 
 class TestMetrics(unittest.TestCase):
-    def test_normal_distribution(self):
-        # For normal distribution, skew=0, excess_kurtosis=0.
-        # ASR should equal SR.
-        np.random.seed(42)
-        returns = np.random.normal(0.01, 0.02, 10000)
-        
-        sr = sharpe_ratio(returns)
-        asr = adjusted_sharpe_ratio(returns)
-        
-        self.assertAlmostEqual(sr, asr, places=2)
+    def test_log_return_drawdown(self):
+        returns = np.log(np.array([1.10, 0.90, 1.20]) / np.array([1.0, 1.0, 1.0]))
+        self.assertAlmostEqual(
+            max_drawdown(returns, return_kind=ReturnKind.LOG),
+            -0.1,
+            places=12,
+        )
 
-    def test_skewed_distribution(self):
-        # Positive skew should increase ASR relative to SR (if SR > 0).
-        np.random.seed(42)
-        # LogNormal is positively skewed
-        returns = np.random.lognormal(0, 0.5, 10000) - np.exp(0.5**2 / 2) + 0.05 # Centered + drift
-        
-        asr = adjusted_sharpe_ratio(returns)
-        self.assertIsInstance(asr, float)
+    def test_arithmetic_return_drawdown(self):
+        returns = np.array([0.10, -0.20, 0.05])
+        self.assertAlmostEqual(max_drawdown(returns, return_kind="simple"), -0.2, places=12)
 
-    def test_sortino_and_drawdown(self):
-        returns = np.array([0.01, -0.02, 0.015, -0.01, 0.005])
-        self.assertIsInstance(sortino_ratio(returns), float)
-        self.assertLessEqual(max_drawdown(returns), 0.0)
+    def test_empty_input(self):
+        self.assertEqual(sharpe_ratio([]), 0.0)
+        self.assertEqual(sortino_ratio([]), 0.0)
+        self.assertEqual(max_drawdown([], return_kind="simple"), 0.0)
+        self.assertEqual(adjusted_sharpe_ratio([]), 0.0)
 
-if __name__ == '__main__':
+    def test_one_point_input(self):
+        returns = np.array([0.02])
+        self.assertEqual(sharpe_ratio(returns), 0.0)
+        self.assertEqual(sortino_ratio(returns), 0.0)
+        self.assertEqual(adjusted_sharpe_ratio(returns), 0.0)
+
+    def test_near_zero_variance_input(self):
+        returns = np.array([0.01, 0.0100000001, 0.0099999999, 0.01000000005])
+        self.assertEqual(sharpe_ratio(returns), 0.0)
+        self.assertEqual(adjusted_sharpe_ratio(returns), 0.0)
+
+    def test_non_finite_input(self):
+        with self.assertRaises(ValueError):
+            sharpe_ratio([0.01, np.nan])
+        with self.assertRaises(ValueError):
+            max_drawdown([0.01, np.inf], return_kind="simple")
+
+    def test_small_sample_adjusted_sharpe_fallback(self):
+        returns = np.array([0.02, 0.03, 0.01])
+        self.assertAlmostEqual(
+            adjusted_sharpe_ratio(returns),
+            sharpe_ratio(returns),
+            places=12,
+        )
+
+
+if __name__ == "__main__":
     unittest.main()
