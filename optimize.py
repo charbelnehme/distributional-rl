@@ -1,49 +1,68 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import optuna
 import pandas as pd
 
 from src.data import AlpacaMarketDataStore, FeatureDataset, build_feature_dataset
-from src.metrics import ReturnKind, adjusted_sharpe_ratio
-from src.strategy import DistributionalStrategy
+from src.metrics import adjusted_sharpe_ratio, max_drawdown
 
+DistributionalStrategy = None
+
+PENALTY_SCORE = -1e9
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ValidationConfig:
-    min_train_timestamps: int = 40
-    validation_timestamps: int = 20
-    step_timestamps: int = 20
-    max_folds: int = 5
+    n_folds: int = 3
+    min_train_rows: int = 20
+    min_validation_rows: int = 10
 
 
 @dataclass(frozen=True)
 class OptimizationConfig:
-    symbols: list[str]
+    symbols: tuple[str, ...]
     timeframe: str
     start: datetime
     end: datetime
-    storage_root: Path = Path("data/alpaca")
+    storage_root: Path
     download: bool = False
     trials: int = 5
-    seed: int = 13
+    seed: int = 42
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    artifacts_dir: Path = Path("artifacts/optimization")
 
 
 @dataclass(frozen=True)
-class OptimizationResult:
-    study: optuna.study.Study
-    dataset: FeatureDataset
+class FoldMetrics:
+    fold_index: int
+    train_rows: int
+    validation_rows: int
+    adjusted_sharpe: float | None
+    mean_return: float | None
+    max_drawdown: float | None
+    turnover: float | None
+    average_leverage: float | None
+    score: float | None
+    failed: bool = False
+    error: str | None = None
+
+
+def parse_utc_datetime(raw_value: str) -> datetime:
+    value = raw_value.strip().replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def load_training_data(
@@ -85,286 +104,377 @@ def load_training_data(
     return dataset
 
 
-def _sort_dataset(dataset: FeatureDataset) -> FeatureDataset:
-    order = (
-        dataset.metadata.assign(timestamp=pd.to_datetime(dataset.metadata["timestamp"], utc=True))
-        .sort_values(["timestamp", "symbol"], kind="mergesort")
-        .index.to_numpy()
-    )
-    return FeatureDataset(
-        features=dataset.features.iloc[order].reset_index(drop=True),
-        target=dataset.target.iloc[order].reset_index(drop=True),
-        metadata=dataset.metadata.iloc[order].reset_index(drop=True),
-        target_name=dataset.target_name,
-    )
+def _score_returns(portfolio_returns: np.ndarray) -> dict[str, float]:
+    mean_return = float(np.mean(portfolio_returns))
+    adjusted_sharpe = float(adjusted_sharpe_ratio(portfolio_returns))
+    drawdown = float(max_drawdown(portfolio_returns))
+    return {
+        "adjusted_sharpe": adjusted_sharpe,
+        "mean_return": mean_return,
+        "max_drawdown": drawdown,
+    }
 
 
-def _parse_utc_datetime(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _walk_forward_splits(
-    dataset: FeatureDataset,
+def _build_walk_forward_folds(
+    metadata: pd.DataFrame,
     validation: ValidationConfig,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    metadata = dataset.metadata.copy()
-    metadata["timestamp"] = pd.to_datetime(metadata["timestamp"], utc=True)
-    timestamps = pd.Index(metadata["timestamp"].drop_duplicates().sort_values())
-    if len(timestamps) < validation.min_train_timestamps + validation.validation_timestamps:
-        raise ValueError("Not enough unique timestamps for walk-forward validation.")
+    if validation.n_folds < 1:
+        raise ValueError("validation.n_folds must be >= 1.")
+    if {"timestamp", "symbol"} - set(metadata.columns):
+        raise ValueError("metadata must contain timestamp and symbol columns.")
 
+    ordered = metadata.copy().reset_index().rename(columns={"index": "row_index"})
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], utc=True)
+    ordered = ordered.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+    unique_timestamps = list(pd.Index(ordered["timestamp"]).drop_duplicates())
+    if len(unique_timestamps) < validation.n_folds + 1:
+        raise ValueError("Not enough unique timestamps to construct walk-forward folds.")
+
+    timestamp_blocks = np.array_split(np.asarray(unique_timestamps, dtype=object), validation.n_folds + 1)
     folds: list[tuple[np.ndarray, np.ndarray]] = []
-    start_index = validation.min_train_timestamps
-    while start_index + validation.validation_timestamps <= len(timestamps):
-        train_timestamps = timestamps[:start_index]
-        validation_timestamps = timestamps[
-            start_index : start_index + validation.validation_timestamps
-        ]
-        train_mask = metadata["timestamp"].isin(train_timestamps).to_numpy()
-        validation_mask = metadata["timestamp"].isin(validation_timestamps).to_numpy()
-        if train_mask.any() and validation_mask.any():
-            folds.append((train_mask, validation_mask))
-        if len(folds) >= validation.max_folds:
-            break
-        start_index += validation.step_timestamps
+    for fold_index in range(1, len(timestamp_blocks)):
+        train_timestamps = np.concatenate(timestamp_blocks[:fold_index])
+        validation_timestamps = np.asarray(timestamp_blocks[fold_index], dtype=object)
+
+        train_mask = ordered["timestamp"].isin(train_timestamps)
+        validation_mask = ordered["timestamp"].isin(validation_timestamps)
+
+        train_rows = ordered.loc[train_mask, "row_index"].to_numpy()
+        validation_rows = ordered.loc[validation_mask, "row_index"].to_numpy()
+
+        if len(train_rows) < validation.min_train_rows or len(validation_rows) < validation.min_validation_rows:
+            continue
+        folds.append((train_rows, validation_rows))
 
     if not folds:
-        raise ValueError("Unable to construct any walk-forward folds.")
-
+        raise ValueError("No walk-forward folds satisfied the minimum row requirements.")
     return folds
 
 
-def _evaluate_validation_fold(
-    strategy: DistributionalStrategy,
-    train_dataset: FeatureDataset,
-    validation_dataset: FeatureDataset,
+def _build_strategy():
+    global DistributionalStrategy
+    if DistributionalStrategy is None:
+        from src.strategy import DistributionalStrategy as strategy_cls
+
+        DistributionalStrategy = strategy_cls
+    return DistributionalStrategy
+
+
+def _fold_turnover(positions: np.ndarray) -> float:
+    if positions.size == 0:
+        return 0.0
+    deltas = np.abs(np.diff(np.concatenate(([0.0], positions))))
+    return float(np.mean(deltas))
+
+
+def _evaluate_fold(
     *,
-    transaction_cost: float,
-) -> float:
-    strategy.fit(train_dataset.features, train_dataset.target)
-    validation = _sort_dataset(validation_dataset)
+    strategy_cls,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    model_params: dict[str, object],
+    simulation_params: dict[str, object],
+    fold_index: int,
+) -> FoldMetrics:
+    strategy = strategy_cls(
+        model_params=model_params,
+        simulation_params=simulation_params,
+    )
+    strategy.fit(X_train, y_train)
+    positions = np.asarray(strategy.predict_positions(X_val), dtype=float)
+    portfolio_returns = positions * y_val.to_numpy(dtype=float)
+    score_components = _score_returns(portfolio_returns)
+    turnover = _fold_turnover(positions)
+    average_leverage = float(np.mean(np.abs(positions))) if positions.size else 0.0
+    score = float(
+        score_components["adjusted_sharpe"]
+        + score_components["mean_return"]
+        + 0.5 * score_components["max_drawdown"]
+        - 0.05 * turnover
+        - 0.01 * average_leverage
+    )
+    return FoldMetrics(
+        fold_index=fold_index,
+        train_rows=len(X_train),
+        validation_rows=len(X_val),
+        adjusted_sharpe=score_components["adjusted_sharpe"],
+        mean_return=score_components["mean_return"],
+        max_drawdown=score_components["max_drawdown"],
+        turnover=turnover,
+        average_leverage=average_leverage,
+        score=score,
+    )
 
-    portfolio_returns: list[float] = []
-    for symbol, symbol_frame in validation.metadata.groupby("symbol", sort=True):
-        symbol_mask = validation.metadata["symbol"] == symbol
-        symbol_features = validation.features.loc[symbol_mask].reset_index(drop=True)
-        symbol_target = validation.target.loc[symbol_mask].reset_index(drop=True)
-        if symbol_features.empty:
-            continue
 
-        positions = strategy.predict_positions(symbol_features, initial_position=0.0)
-        realised_simple_returns = np.expm1(np.asarray(symbol_target, dtype=float))
+def _objective_summary(folds: list[FoldMetrics], failures: int, nan_scores: int) -> dict[str, object]:
+    valid_folds = [fold for fold in folds if not fold.failed and fold.score is not None and np.isfinite(fold.score)]
+    if not valid_folds:
+        return {
+            "score": PENALTY_SCORE,
+            "fold_count": len(folds),
+            "valid_fold_count": 0,
+            "failures": failures,
+            "nan_scores": nan_scores,
+        }
 
-        previous_position = 0.0
-        for position, realised_return in zip(positions, realised_simple_returns):
-            turnover = abs(float(position) - previous_position)
-            portfolio_return = (float(position) * float(realised_return)) - (
-                turnover * transaction_cost
-            )
-            if portfolio_return <= -1.0:
-                raise ValueError("Validation portfolio return fell below -100%.")
-            portfolio_returns.append(portfolio_return)
-            previous_position = float(position)
+    fold_scores = np.asarray([fold.score for fold in valid_folds], dtype=float)
+    fold_sharpes = np.asarray([fold.adjusted_sharpe for fold in valid_folds if fold.adjusted_sharpe is not None], dtype=float)
+    fold_returns = np.asarray([fold.mean_return for fold in valid_folds if fold.mean_return is not None], dtype=float)
+    score = float(np.median(fold_scores) - 0.1 * np.std(fold_scores))
+    if fold_sharpes.size:
+        score += 0.05 * float(np.median(fold_sharpes))
+    if fold_returns.size:
+        score += 0.05 * float(np.mean(fold_returns))
+    return {
+        "score": score,
+        "fold_count": len(folds),
+        "valid_fold_count": len(valid_folds),
+        "failures": failures,
+        "nan_scores": nan_scores,
+    }
 
-    if len(portfolio_returns) < 2:
-        raise ValueError("Validation fold produced too few portfolio returns.")
 
-    return adjusted_sharpe_ratio(np.asarray(portfolio_returns, dtype=float))
+def make_objective(dataset: FeatureDataset, config: OptimizationConfig):
+    validation_folds = _build_walk_forward_folds(dataset.metadata, config.validation)
 
-
-def make_objective(dataset: FeatureDataset, validation: ValidationConfig, seed: int):
-    sorted_dataset = _sort_dataset(dataset)
-    folds = _walk_forward_splits(sorted_dataset, validation)
-
-    def objective(trial: optuna.trial.Trial) -> float:
-        trial_seed = seed + trial.number
-        rng = np.random.default_rng(trial_seed)
-
+    def objective(trial: optuna.Trial) -> float:
+        strategy_cls = _build_strategy()
         dist_name = trial.suggest_categorical("dist_name", ["Normal", "StudentT"])
-        n_estimators = trial.suggest_int("n_estimators", 25, 200)
+        n_estimators = trial.suggest_int("n_estimators", 10, 100)
         learning_rate = trial.suggest_float("learning_rate", 0.001, 0.1, log=True)
-        transaction_cost = trial.suggest_float("transaction_cost", 0.0, 0.002)
         leverage_penalty = trial.suggest_float("leverage_penalty", 0.0, 0.05)
-        downside_penalty = trial.suggest_float("downside_penalty", 0.0, 0.1)
         expected_return_weight = trial.suggest_float("expected_return_weight", 0.5, 2.0)
-        n_samples = trial.suggest_categorical("n_samples", [64, 128, 256])
-        allow_shorting = trial.suggest_categorical("allow_shorting", [False, True])
 
-        grid_points = np.linspace(-2.0 if allow_shorting else 0.0, 2.0, 17)
         model_params = {
             "dist_name": dist_name,
             "n_estimators": n_estimators,
             "learning_rate": learning_rate,
-            "random_state": trial_seed,
         }
         simulation_params = {
-            "grid_points": grid_points,
-            "n_samples": n_samples,
-            "transaction_cost": transaction_cost,
+            "grid_points": np.linspace(0, 2, 11),
+            "n_samples": 100,
             "leverage_penalty": leverage_penalty,
-            "downside_penalty": downside_penalty,
             "expected_return_weight": expected_return_weight,
-            "allow_shorting": allow_shorting,
-            "random_state": trial_seed,
-            "return_kind": ReturnKind.LOG,
         }
-        strategy = DistributionalStrategy(
-            model_params=model_params,
-            simulation_params=simulation_params,
-        )
 
-        fold_scores: list[float] = []
-        try:
-            for fold_index, (train_mask, validation_mask) in enumerate(folds):
-                train_dataset = sorted_dataset.subset(train_mask)
-                validation_dataset = sorted_dataset.subset(validation_mask)
-                score = _evaluate_validation_fold(
-                    strategy,
-                    train_dataset,
-                    validation_dataset,
-                    transaction_cost=transaction_cost,
+        fold_metrics: list[FoldMetrics] = []
+        failures = 0
+        nan_scores = 0
+
+        for fold_index, (train_rows, validation_rows) in enumerate(validation_folds, start=1):
+            X_train = dataset.features.iloc[train_rows]
+            y_train = dataset.target.iloc[train_rows]
+            X_val = dataset.features.iloc[validation_rows]
+            y_val = dataset.target.iloc[validation_rows]
+
+            try:
+                fold = _evaluate_fold(
+                    strategy_cls=strategy_cls,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    y_val=y_val,
+                    model_params=model_params,
+                    simulation_params=simulation_params,
+                    fold_index=fold_index,
                 )
-                fold_scores.append(float(score))
-                trial.set_user_attr(f"fold_{fold_index}_score", float(score))
+                if fold.score is None or not np.isfinite(fold.score):
+                    nan_scores += 1
+                    failures += 1
+                    fold = FoldMetrics(
+                        **{**asdict(fold), "failed": True, "error": "non-finite score"}
+                    )
+            except Exception as exc:
+                failures += 1
+                fold = FoldMetrics(
+                    fold_index=fold_index,
+                    train_rows=len(X_train),
+                    validation_rows=len(X_val),
+                    adjusted_sharpe=None,
+                    mean_return=None,
+                    max_drawdown=None,
+                    turnover=None,
+                    average_leverage=None,
+                    score=None,
+                    failed=True,
+                    error=str(exc),
+                )
+            fold_metrics.append(fold)
 
-            if not fold_scores:
-                raise ValueError("No validation folds were scored.")
-
-            score_array = np.asarray(fold_scores, dtype=float)
-            objective_value = float(np.mean(score_array) - 0.25 * np.std(score_array, ddof=0))
-            trial.set_user_attr("fold_scores", fold_scores)
-            trial.set_user_attr("mean_fold_score", float(np.mean(score_array)))
-            trial.set_user_attr("std_fold_score", float(np.std(score_array, ddof=0)))
-            trial.set_user_attr("trial_seed", trial_seed)
-            trial.set_user_attr("grid_points", grid_points.tolist())
-            return objective_value
-        except optuna.TrialPruned:
-            raise
-        except ValueError as exc:
-            trial.set_user_attr("failure_type", "invalid_trial")
-            trial.set_user_attr("failure_message", str(exc))
-            LOGGER.info("Pruning trial %s: %s", trial.number, exc)
-            raise optuna.TrialPruned(str(exc)) from exc
-        except Exception as exc:
-            trial.set_user_attr("failure_type", type(exc).__name__)
-            trial.set_user_attr("failure_message", str(exc))
-            LOGGER.exception("Trial %s failed unexpectedly", trial.number)
-            raise
+        summary = _objective_summary(fold_metrics, failures=failures, nan_scores=nan_scores)
+        trial.set_user_attr("seed", config.seed)
+        trial.set_user_attr("validation_folds", [asdict(fold) for fold in fold_metrics])
+        trial.set_user_attr(
+            "data_sizes",
+            [
+                {
+                    "fold_index": fold.fold_index,
+                    "train_rows": fold.train_rows,
+                    "validation_rows": fold.validation_rows,
+                }
+                for fold in fold_metrics
+            ],
+        )
+        trial.set_user_attr("failures", failures)
+        trial.set_user_attr("nan_scores", nan_scores)
+        trial.set_user_attr("valid_fold_count", summary["valid_fold_count"])
+        trial.set_user_attr("fold_count", summary["fold_count"])
+        trial.set_user_attr("aggregate_score", summary["score"])
+        return float(summary["score"])
 
     return objective
 
 
-def run_optimization(config: OptimizationConfig) -> OptimizationResult:
+def _json_default(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, set):
+        return sorted(value)
+    return str(value)
+
+
+def persist_study_artifacts(
+    *,
+    study: optuna.Study,
+    config: OptimizationConfig,
+    dataset: FeatureDataset,
+) -> dict[str, Path]:
+    config.artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    best_trial = study.best_trial
+    best_payload = {
+        "value": best_trial.value,
+        "params": best_trial.params,
+        "user_attrs": best_trial.user_attrs,
+        "symbols": list(config.symbols),
+        "timeframe": config.timeframe,
+        "start": config.start,
+        "end": config.end,
+        "dataset_rows": len(dataset.features),
+        "validation": asdict(config.validation),
+        "seed": config.seed,
+    }
+
+    best_trial_path = config.artifacts_dir / "best_trial.json"
+    fold_metrics_path = config.artifacts_dir / "best_trial_folds.json"
+    study_summary_path = config.artifacts_dir / "study_summary.json"
+
+    best_trial_path.write_text(json.dumps(best_payload, indent=2, default=_json_default))
+    fold_metrics_path.write_text(
+        json.dumps(best_trial.user_attrs.get("validation_folds", []), indent=2, default=_json_default)
+    )
+    study_summary_path.write_text(
+        json.dumps(
+            {
+                "best_value": best_trial.value,
+                "best_params": best_trial.params,
+                "trial_count": len(study.trials),
+                "seed": config.seed,
+            },
+            indent=2,
+            default=_json_default,
+        )
+    )
+
+    return {
+        "best_trial": best_trial_path,
+        "fold_metrics": fold_metrics_path,
+        "study_summary": study_summary_path,
+    }
+
+
+def run_optimization(dataset: FeatureDataset, config: OptimizationConfig) -> optuna.Study:
+    sampler = optuna.samplers.TPESampler(seed=config.seed)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.set_user_attr("seed", config.seed)
+    study.set_user_attr("validation", asdict(config.validation))
+    study.set_user_attr("artifacts_dir", str(config.artifacts_dir))
+    study.optimize(make_objective(dataset, config), n_trials=config.trials)
+    persist_study_artifacts(study=study, config=config, dataset=dataset)
+    return study
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Optimize strategy hyperparameters.")
+    parser.add_argument("--symbols", nargs="+", required=True, help="Ticker symbols to use.")
+    parser.add_argument("--timeframe", default="1Day", help="Alpaca timeframe, e.g. 1Min or 1Day.")
+    parser.add_argument("--start", required=True, help="UTC ISO timestamp, e.g. 2024-01-01T00:00:00+00:00")
+    parser.add_argument("--end", required=True, help="UTC ISO timestamp, e.g. 2024-03-01T00:00:00+00:00")
+    parser.add_argument("--storage-root", default="data/alpaca", help="Parquet storage root.")
+    parser.add_argument("--download", action="store_true", help="Download bars from Alpaca before optimizing.")
+    parser.add_argument("--trials", type=int, default=5, help="Number of Optuna trials.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for Optuna and model sampling.")
+    parser.add_argument(
+        "--artifacts-dir",
+        default="artifacts/optimization",
+        help="Directory for best-trial and fold-metric artifacts.",
+    )
+    parser.add_argument("--validation-folds", type=int, default=3, help="Number of walk-forward validation folds.")
+    parser.add_argument(
+        "--validation-min-train-rows",
+        type=int,
+        default=20,
+        help="Minimum training rows required for each fold.",
+    )
+    parser.add_argument(
+        "--validation-min-validation-rows",
+        type=int,
+        default=10,
+        help="Minimum validation rows required for each fold.",
+    )
+    return parser.parse_args()
+
+
+def _config_from_args(args: argparse.Namespace) -> OptimizationConfig:
+    return OptimizationConfig(
+        symbols=tuple(args.symbols),
+        timeframe=args.timeframe,
+        start=parse_utc_datetime(args.start),
+        end=parse_utc_datetime(args.end),
+        storage_root=Path(args.storage_root),
+        download=bool(args.download),
+        trials=int(args.trials),
+        seed=int(args.seed),
+        validation=ValidationConfig(
+            n_folds=int(args.validation_folds),
+            min_train_rows=int(args.validation_min_train_rows),
+            min_validation_rows=int(args.validation_min_validation_rows),
+        ),
+        artifacts_dir=Path(args.artifacts_dir),
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    config = _config_from_args(args)
+
     dataset = load_training_data(
-        symbols=config.symbols,
+        symbols=list(config.symbols),
         timeframe=config.timeframe,
         start=config.start,
         end=config.end,
         storage_root=config.storage_root,
         download=config.download,
+        return_metadata=True,
     )
 
-    sampler = optuna.samplers.TPESampler(seed=config.seed, multivariate=True)
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=0)
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
-
-    LOGGER.info(
-        "Starting optimization with %s trials over %s rows and %s unique timestamps",
-        config.trials,
-        len(dataset),
-        dataset.metadata["timestamp"].nunique(),
-    )
-    study.optimize(
-        make_objective(dataset, config.validation, config.seed),
-        n_trials=config.trials,
-        gc_after_trial=True,
-    )
-    return OptimizationResult(study=study, dataset=dataset)
-
-
-def parse_args() -> OptimizationConfig:
-    parser = argparse.ArgumentParser(description="Optimize strategy hyperparameters.")
-    parser.add_argument("--symbols", nargs="+", required=True, help="Ticker symbols to use.")
-    parser.add_argument("--timeframe", default="1Day", help="Alpaca timeframe, e.g. 1Min or 1Day.")
-    parser.add_argument(
-        "--start",
-        required=True,
-        help="UTC ISO timestamp, e.g. 2024-01-01T00:00:00+00:00",
-    )
-    parser.add_argument(
-        "--end",
-        required=True,
-        help="UTC ISO timestamp, e.g. 2024-03-01T00:00:00+00:00",
-    )
-    parser.add_argument("--storage-root", default="data/alpaca", help="Parquet storage root.")
-    parser.add_argument("--download", action="store_true", help="Download bars from Alpaca before optimizing.")
-    parser.add_argument("--trials", type=int, default=5, help="Number of Optuna trials.")
-    parser.add_argument("--seed", type=int, default=13, help="Deterministic seed.")
-    parser.add_argument(
-        "--min-train-timestamps",
-        type=int,
-        default=40,
-        help="Minimum unique timestamps used before the first validation fold.",
-    )
-    parser.add_argument(
-        "--validation-timestamps",
-        type=int,
-        default=20,
-        help="Number of timestamps per validation fold.",
-    )
-    parser.add_argument(
-        "--step-timestamps",
-        type=int,
-        default=20,
-        help="Number of timestamps to advance between walk-forward folds.",
-    )
-    parser.add_argument(
-        "--max-folds",
-        type=int,
-        default=5,
-        help="Maximum number of walk-forward folds to evaluate.",
-    )
-    args = parser.parse_args()
-
-    return OptimizationConfig(
-        symbols=args.symbols,
-        timeframe=args.timeframe,
-        start=_parse_utc_datetime(args.start),
-        end=_parse_utc_datetime(args.end),
-        storage_root=Path(args.storage_root),
-        download=args.download,
-        trials=args.trials,
-        seed=args.seed,
-        validation=ValidationConfig(
-            min_train_timestamps=args.min_train_timestamps,
-            validation_timestamps=args.validation_timestamps,
-            step_timestamps=args.step_timestamps,
-            max_folds=args.max_folds,
-        ),
-    )
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    config = parse_args()
-    result = run_optimization(config)
+    study = run_optimization(dataset, config)
 
     print("Best trial:")
-    trial = result.study.best_trial
+    trial = study.best_trial
     print(f"  Value: {trial.value}")
     print("  Params:")
     for key, value in trial.params.items():
         print(f"    {key}: {value}")
-    if trial.user_attrs:
-        print("  Diagnostics:")
-        for key, value in trial.user_attrs.items():
-            print(f"    {key}: {value}")
+    print(f"  Artifacts: {config.artifacts_dir}")
 
 
 if __name__ == "__main__":

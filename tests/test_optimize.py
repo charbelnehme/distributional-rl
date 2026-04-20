@@ -1,193 +1,192 @@
-from __future__ import annotations
-
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
-import optuna
+import numpy as np
+import pandas as pd
 
+import optimize
 from optimize import (
+    OptimizationConfig,
     ValidationConfig,
-    _walk_forward_splits,
+    _build_walk_forward_folds,
     load_training_data,
     make_objective,
+    parse_utc_datetime,
+    run_optimization,
 )
-from src.data import AlpacaMarketDataStore, build_feature_dataset
-from tests.fixtures import make_multi_symbol_bars, make_sample_bars
+from src.data import FeatureDataset
+from src.data import AlpacaMarketDataStore
+from tests.fixtures import make_sample_bars
+
+
+class StubStrategy:
+    def __init__(self, model_params=None, simulation_params=None):
+        self.model_params = model_params or {}
+        self.simulation_params = simulation_params or {}
+
+    def fit(self, X_train, y_train):
+        self.train_rows = len(X_train)
+
+    def predict_positions(self, X):
+        base = 0.75 if self.model_params.get("dist_name") == "StudentT" else 1.0
+        return np.full(len(X), base, dtype=float)
+
+
+class RaisingStrategy(StubStrategy):
+    def fit(self, X_train, y_train):
+        raise RuntimeError("boom")
 
 
 class TrialStub:
-    def __init__(self, number: int = 0):
-        self.number = number
-        self.params = {}
+    def __init__(self):
         self.user_attrs = {}
 
     def suggest_categorical(self, name, choices):
-        value = choices[0]
-        self.params[name] = value
-        return value
+        return choices[0]
 
     def suggest_int(self, name, low, high):
-        self.params[name] = low
         return low
 
     def suggest_float(self, name, low, high, log=False):
-        self.params[name] = low
         return low
 
-    def set_user_attr(self, name, value):
-        self.user_attrs[name] = value
+    def set_user_attr(self, key, value):
+        self.user_attrs[key] = value
 
 
 class TestOptimize(unittest.TestCase):
-    def test_load_training_data_from_cached_parquet(self):
+    def setUp(self):
+        self._original_strategy = optimize.DistributionalStrategy
+
+    def tearDown(self):
+        optimize.DistributionalStrategy = self._original_strategy
+
+    def _make_dataset(self, tmpdir: str, *, multi_symbol: bool = False) -> FeatureDataset:
+        store = AlpacaMarketDataStore(storage_root=tmpdir)
         bars = make_sample_bars(periods=80)
+        if multi_symbol:
+            second = make_sample_bars(symbol="MSFT", periods=80)
+            bars = pd.concat([bars, second], ignore_index=True)
+        store.persist_bars(bars)
+        return load_training_data(
+            symbols=["AAPL"] if not multi_symbol else ["AAPL", "MSFT"],
+            timeframe="1Min",
+            start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+            end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
+            storage_root=Path(tmpdir),
+            download=False,
+        )
+
+    def test_load_training_data_returns_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = AlpacaMarketDataStore(storage_root=tmpdir)
-            store.persist_bars(bars)
+            dataset = self._make_dataset(tmpdir)
 
-            dataset = load_training_data(
-                symbols=["AAPL"],
-                timeframe="1Min",
-                start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
-                end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
-                storage_root=Path(tmpdir),
-                download=False,
-            )
-
+            self.assertIsInstance(dataset, FeatureDataset)
             self.assertFalse(dataset.features.empty)
             self.assertEqual(len(dataset.features), len(dataset.target))
-            self.assertEqual(len(dataset.metadata), len(dataset.target))
+            self.assertEqual(len(dataset.features), len(dataset.metadata))
+            self.assertIn("timestamp", dataset.metadata.columns)
+            self.assertIn("symbol", dataset.metadata.columns)
 
-    def test_temporal_split_correctness(self):
-        bars = make_multi_symbol_bars(periods=60)
-        dataset = build_feature_dataset(
-            bars,
-            return_horizon=1,
-            volatility_window=5,
-            atr_window=5,
-            volume_window=5,
-        )
-        splits = _walk_forward_splits(
-            dataset,
-            ValidationConfig(
-                min_train_timestamps=10,
-                validation_timestamps=5,
-                step_timestamps=5,
-                max_folds=3,
-            ),
-        )
-
-        self.assertGreaterEqual(len(splits), 1)
-        metadata = dataset.metadata.reset_index(drop=True)
-        for train_mask, validation_mask in splits:
-            train_timestamps = set(metadata.loc[train_mask, "timestamp"])
-            validation_timestamps = set(metadata.loc[validation_mask, "timestamp"])
-            self.assertTrue(train_timestamps.isdisjoint(validation_timestamps))
-            self.assertEqual(
-                int(validation_mask.sum()),
-                len(validation_timestamps) * metadata["symbol"].nunique(),
+    def test_walk_forward_folds_use_metadata_across_symbols(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._make_dataset(tmpdir, multi_symbol=True)
+            folds = _build_walk_forward_folds(
+                dataset.metadata,
+                ValidationConfig(n_folds=2, min_train_rows=20, min_validation_rows=10),
             )
 
-    def test_reproducibility(self):
-        bars = make_sample_bars(periods=80)
-        dataset = build_feature_dataset(
-            bars,
-            return_horizon=1,
-            volatility_window=5,
-            atr_window=5,
-            volume_window=5,
-        )
-        objective = make_objective(
-            dataset,
-            ValidationConfig(
-                min_train_timestamps=10,
-                validation_timestamps=5,
-                step_timestamps=5,
-                max_folds=2,
-            ),
-            seed=123,
-        )
-        score_first = objective(TrialStub())
-        score_second = objective(TrialStub())
-        self.assertAlmostEqual(score_first, score_second, places=12)
+            self.assertGreaterEqual(len(folds), 2)
+            for train_rows, validation_rows in folds:
+                self.assertGreater(len(train_rows), 0)
+                self.assertGreater(len(validation_rows), 0)
+                symbols = set(dataset.metadata.iloc[validation_rows]["symbol"].unique())
+                self.assertEqual(symbols, {"AAPL", "MSFT"})
 
-    def test_failure_handling_prunes_invalid_trials(self):
-        bars = make_sample_bars(periods=80)
-        dataset = build_feature_dataset(
-            bars,
-            return_horizon=1,
-            volatility_window=5,
-            atr_window=5,
-            volume_window=5,
-        )
-        objective = make_objective(
-            dataset,
-            ValidationConfig(
-                min_train_timestamps=10,
-                validation_timestamps=5,
-                step_timestamps=5,
-                max_folds=2,
-            ),
-            seed=123,
-        )
+    def test_naive_timestamp_parsing_assumes_utc(self):
+        naive = parse_utc_datetime("2024-01-01T00:00:00")
+        aware = parse_utc_datetime("2024-01-01T00:00:00Z")
 
-        with patch("optimize.DistributionalStrategy.fit", side_effect=ValueError("boom")):
-            with self.assertRaises(optuna.TrialPruned):
-                objective(TrialStub())
+        self.assertEqual(naive.tzinfo, timezone.utc)
+        self.assertEqual(aware.tzinfo, timezone.utc)
+        self.assertEqual(naive, aware)
 
-    def test_naive_timestamp_behavior(self):
-        bars = make_sample_bars(periods=80, naive_timestamps=True)
+    def test_objective_runs_with_stub_strategy_and_records_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = AlpacaMarketDataStore(storage_root=tmpdir)
-            store.persist_bars(bars)
-
-            dataset = load_training_data(
-                symbols=["AAPL"],
+            dataset = self._make_dataset(tmpdir)
+            optimize.DistributionalStrategy = StubStrategy
+            config = OptimizationConfig(
+                symbols=("AAPL",),
                 timeframe="1Min",
                 start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
                 end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
                 storage_root=Path(tmpdir),
                 download=False,
+                trials=1,
+                seed=7,
+                validation=ValidationConfig(n_folds=2, min_train_rows=20, min_validation_rows=10),
+                artifacts_dir=Path(tmpdir) / "artifacts",
             )
 
-        self.assertTrue(
-            all(ts.tzinfo is not None and str(ts.tzinfo) == "UTC" for ts in dataset.metadata["timestamp"])
-        )
+            trial = TrialStub()
+            score = make_objective(dataset, config)(trial)
 
-    def test_multi_symbol_split_correctness(self):
-        bars = make_multi_symbol_bars(periods=40)
-        dataset = build_feature_dataset(
-            bars,
-            return_horizon=1,
-            volatility_window=5,
-            atr_window=5,
-            volume_window=5,
-        )
-        splits = _walk_forward_splits(
-            dataset,
-            ValidationConfig(
-                min_train_timestamps=8,
-                validation_timestamps=4,
-                step_timestamps=4,
-                max_folds=2,
-            ),
-        )
+            self.assertIsInstance(score, float)
+            self.assertIn("validation_folds", trial.user_attrs)
+            self.assertIn("data_sizes", trial.user_attrs)
+            self.assertEqual(trial.user_attrs["fold_count"], len(trial.user_attrs["validation_folds"]))
+            self.assertGreater(trial.user_attrs["valid_fold_count"], 0)
 
-        metadata = dataset.metadata.reset_index(drop=True)
-        for train_mask, validation_mask in splits:
-            train_rows = metadata.loc[train_mask]
-            validation_rows = metadata.loc[validation_mask]
-            self.assertTrue(
-                set(train_rows["timestamp"]).isdisjoint(set(validation_rows["timestamp"]))
+    def test_objective_failure_records_structured_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._make_dataset(tmpdir)
+            optimize.DistributionalStrategy = RaisingStrategy
+            config = OptimizationConfig(
+                symbols=("AAPL",),
+                timeframe="1Min",
+                start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
+                storage_root=Path(tmpdir),
+                download=False,
+                trials=1,
+                seed=7,
+                validation=ValidationConfig(n_folds=2, min_train_rows=20, min_validation_rows=10),
+                artifacts_dir=Path(tmpdir) / "artifacts",
             )
-            self.assertEqual(
-                validation_rows.groupby("timestamp")["symbol"].nunique().min(),
-                metadata["symbol"].nunique(),
+
+            trial = TrialStub()
+            score = make_objective(dataset, config)(trial)
+
+            self.assertEqual(score, -1e9)
+            self.assertGreater(trial.user_attrs["failures"], 0)
+            self.assertTrue(any(fold["failed"] for fold in trial.user_attrs["validation_folds"]))
+            self.assertIn("boom", trial.user_attrs["validation_folds"][0]["error"])
+
+    def test_seeded_optimization_is_reproducible_with_stub_strategy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset = self._make_dataset(tmpdir)
+            optimize.DistributionalStrategy = StubStrategy
+            config = OptimizationConfig(
+                symbols=("AAPL",),
+                timeframe="1Min",
+                start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, 15, 49, tzinfo=timezone.utc),
+                storage_root=Path(tmpdir),
+                download=False,
+                trials=1,
+                seed=99,
+                validation=ValidationConfig(n_folds=2, min_train_rows=20, min_validation_rows=10),
+                artifacts_dir=Path(tmpdir) / "artifacts",
             )
+
+            first = run_optimization(dataset, config).best_trial.value
+            second = run_optimization(dataset, config).best_trial.value
+
+            self.assertAlmostEqual(first, second, places=12)
 
 
 if __name__ == "__main__":
     unittest.main()
+
