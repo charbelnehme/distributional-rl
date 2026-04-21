@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Iterator, Optional, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,10 @@ _BAR_COLUMNS = [
     "timeframe",
 ]
 
+_BAR_FILENAME_RE = re.compile(
+    r"^bars_(?P<start>\d{8}T\d{6}Z)_(?P<end>\d{8}T\d{6}Z)\.parquet$"
+)
+
 
 class HistoricalBarsClientProtocol(Protocol):
     def get_stock_bars(self, request_params: object) -> object:
@@ -58,6 +63,43 @@ class AlpacaCredentials:
         return cls(api_key=api_key, secret_key=secret_key)
 
 
+@dataclass(frozen=True)
+class FeatureDataset:
+    """Feature, target, and metadata bundle for time-series model inputs."""
+
+    features: pd.DataFrame
+    target: pd.Series
+    metadata: pd.DataFrame
+    target_name: str = "future_log_return"
+
+    def __post_init__(self) -> None:
+        if len(self.features) != len(self.target) or len(self.features) != len(self.metadata):
+            raise ValueError("FeatureDataset components must have the same length.")
+        if not {"timestamp", "symbol"}.issubset(self.metadata.columns):
+            raise ValueError("FeatureDataset metadata must include timestamp and symbol.")
+
+    def __iter__(self) -> Iterator[pd.DataFrame | pd.Series]:
+        yield self.features
+        yield self.target
+
+    def __len__(self) -> int:
+        return len(self.target)
+
+    def subset(self, mask: Sequence[bool] | np.ndarray | pd.Series) -> "FeatureDataset":
+        selected = np.asarray(mask, dtype=bool)
+        if selected.shape[0] != len(self):
+            raise ValueError("Subset mask must match dataset length.")
+        return FeatureDataset(
+            features=self.features.loc[selected].reset_index(drop=True),
+            target=self.target.loc[selected].reset_index(drop=True),
+            metadata=self.metadata.loc[selected].reset_index(drop=True),
+            target_name=self.target_name,
+        )
+
+    def as_tuple(self) -> tuple[pd.DataFrame, pd.Series]:
+        return self.features, self.target
+
+
 def _import_alpaca_market_data() -> tuple[Any, Any, Any, Any, Any]:
     try:
         from alpaca.data.enums import Adjustment, DataFeed
@@ -66,11 +108,14 @@ def _import_alpaca_market_data() -> tuple[Any, Any, Any, Any, Any]:
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "src.data requires alpaca-py for Alpaca market data "
-            "retrieval. Install project dependencies with `pip install -e .`."
+            "src.data requires alpaca-py for Alpaca market data retrieval. "
+            "Install project dependencies with `pip install -e .`."
         ) from exc
 
-    return StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit, (DataFeed, Adjustment)
+    return StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit, (
+        DataFeed,
+        Adjustment,
+    )
 
 
 def _normalize_datetime(value: datetime) -> datetime:
@@ -133,18 +178,6 @@ def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
     if not normalized:
         raise ValueError("At least one symbol is required.")
     return normalized
-
-
-def _validate_positive_integer(name: str, value: int) -> None:
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1.")
-
-
-def _validate_bars_frame(bars: pd.DataFrame) -> None:
-    required_columns = {"symbol", "timestamp", "open", "high", "low", "close", "volume", "timeframe"}
-    missing = required_columns.difference(bars.columns)
-    if missing:
-        raise ValueError(f"Bars data is missing required columns: {sorted(missing)}")
 
 
 def _bars_to_dataframe(response: object, timeframe: str) -> pd.DataFrame:
@@ -236,6 +269,117 @@ def _resolve_enum_member(enum_type: Any, value: str) -> Any:
     raise ValueError(f"Unsupported value '{value}' for enum {enum_type.__name__}.")
 
 
+def _validate_bars_frame(bars: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
+    missing = required_columns.difference(bars.columns)
+    if missing:
+        raise ValueError(f"Bars data is missing required columns: {sorted(missing)}")
+
+    frame = bars.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = frame.dropna(subset=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+    if frame.empty:
+        raise ValueError("Bars data is empty after dropping missing required values.")
+
+    price_columns = ["open", "high", "low", "close"]
+    if (frame[price_columns] <= 0).any().any():
+        raise ValueError("Bars data must contain strictly positive prices.")
+
+    if "timeframe" not in frame.columns:
+        frame["timeframe"] = "1Day"
+    if "trade_count" not in frame.columns:
+        frame["trade_count"] = np.nan
+    if "vwap" not in frame.columns:
+        frame["vwap"] = np.nan
+
+    return (
+        frame[
+            [
+                "symbol",
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trade_count",
+                "vwap",
+                "timeframe",
+            ]
+        ]
+        .sort_values(["symbol", "timestamp"])
+        .drop_duplicates(["symbol", "timestamp", "timeframe"])
+        .reset_index(drop=True)
+    )
+
+
+def _parse_filename_window(path: Path) -> tuple[datetime, datetime] | None:
+    match = _BAR_FILENAME_RE.match(path.name)
+    if not match:
+        return None
+    start = datetime.strptime(match.group("start"), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    end = datetime.strptime(match.group("end"), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    return start, end
+
+
+def _overlaps_window(
+    file_window: tuple[datetime, datetime] | None,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    if file_window is None:
+        return True
+    if start is None and end is None:
+        return True
+    file_start, file_end = file_window
+    start_utc = _normalize_datetime(start) if start is not None else None
+    end_utc = _normalize_datetime(end) if end is not None else None
+    if start_utc is not None and file_end < start_utc:
+        return False
+    if end_utc is not None and file_start > end_utc:
+        return False
+    return True
+
+
+def _candidate_parquet_paths(
+    storage_root: Path,
+    *,
+    symbols: Optional[Sequence[str]] = None,
+    timeframe: Optional[str] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> list[Path]:
+    roots: list[Path] = []
+    if symbols:
+        for symbol in dict.fromkeys(symbols):
+            symbol_root = storage_root / f"symbol={symbol}"
+            if timeframe is not None:
+                roots.append(symbol_root / f"timeframe={timeframe}")
+            else:
+                roots.append(symbol_root)
+    else:
+        roots.append(storage_root)
+
+    paths: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for parquet_path in root.rglob("*.parquet"):
+            parts = {
+                part.split("=", 1)[0]: part.split("=", 1)[1]
+                for part in parquet_path.parts
+                if "=" in part
+            }
+            path_timeframe = parts.get("timeframe")
+            if timeframe is not None and path_timeframe != timeframe:
+                continue
+            if not _overlaps_window(_parse_filename_window(parquet_path), start, end):
+                continue
+            paths.append(parquet_path)
+
+    return sorted(set(paths))
+
+
 def build_feature_dataset(
     bars: pd.DataFrame,
     *,
@@ -243,31 +387,26 @@ def build_feature_dataset(
     volatility_window: int = 20,
     atr_window: int = 14,
     volume_window: int = 20,
-    return_metadata: bool = False,
-) -> tuple[pd.DataFrame, pd.Series] | tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    required_columns = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
-    missing = required_columns.difference(bars.columns)
-    if missing:
-        raise ValueError(f"Bars data is missing required columns: {sorted(missing)}")
-    _validate_positive_integer("return_horizon", return_horizon)
-    _validate_positive_integer("volatility_window", volatility_window)
-    _validate_positive_integer("atr_window", atr_window)
-    _validate_positive_integer("volume_window", volume_window)
+) -> FeatureDataset:
+    if return_horizon < 1:
+        raise ValueError("return_horizon must be >= 1.")
+    if volatility_window < 2 or atr_window < 1 or volume_window < 1:
+        raise ValueError("Feature windows must be positive and volatility_window >= 2.")
 
-    frame = bars.copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    frame = frame.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    frame = _validate_bars_frame(bars)
+    frame["symbol"] = frame["symbol"].astype(str)
+    grouped = frame.groupby("symbol", group_keys=False, sort=False)
 
-    grouped = frame.groupby("symbol", group_keys=False)
-    prev_close = grouped["close"].shift(1)
     log_close = np.log(frame["close"])
     frame["log_return"] = log_close.groupby(frame["symbol"]).diff()
 
     intrabar_range = (frame["high"] - frame["low"]).replace(0, np.nan)
-    frame["bar_portion"] = (
-        (frame["close"] - frame["low"]) / intrabar_range
-    ).clip(lower=0.0, upper=1.0).fillna(0.5)
+    frame["bar_portion"] = ((frame["close"] - frame["low"]) / intrabar_range).clip(
+        lower=0.0,
+        upper=1.0,
+    ).fillna(0.5)
 
+    prev_close = grouped["close"].shift(1)
     true_range = pd.concat(
         [
             frame["high"] - frame["low"],
@@ -276,6 +415,7 @@ def build_feature_dataset(
         ],
         axis=1,
     ).max(axis=1)
+    true_range_pct = true_range / prev_close.replace(0, np.nan)
 
     frame["realised_vol"] = grouped["log_return"].transform(
         lambda values: values.rolling(
@@ -283,9 +423,8 @@ def build_feature_dataset(
             min_periods=volatility_window,
         ).std(ddof=0)
     )
-    frame["_true_range"] = true_range
-    grouped = frame.groupby("symbol", group_keys=False)
-    frame["atr"] = grouped["_true_range"].transform(
+    frame["_true_range_pct"] = true_range_pct
+    frame["atr_pct"] = grouped["_true_range_pct"].transform(
         lambda values: values.rolling(window=atr_window, min_periods=atr_window).mean()
     )
     frame["vol_percentile"] = grouped["volume"].transform(
@@ -294,37 +433,30 @@ def build_feature_dataset(
             min_periods=volume_window,
         ).apply(_last_rank_percentile, raw=True)
     )
-    frame["target_return"] = grouped["close"].transform(
+    frame["future_log_return"] = grouped["close"].transform(
         lambda values: np.log(values.shift(-return_horizon) / values)
     )
 
-    dataset = frame[
-        [
-            "timestamp",
-            "symbol",
-            "bar_portion",
-            "log_return",
-            "realised_vol",
-            "atr",
-            "vol_percentile",
-            "target_return",
-        ]
-    ].dropna()
+    feature_columns = [
+        "bar_portion",
+        "log_return",
+        "realised_vol",
+        "atr_pct",
+        "vol_percentile",
+    ]
+    dataset_columns = [
+        "timestamp",
+        "symbol",
+        "timeframe",
+        *feature_columns,
+        "future_log_return",
+    ]
+    dataset = frame.loc[:, dataset_columns].dropna().reset_index(drop=True)
 
-    features = dataset[
-        [
-            "bar_portion",
-            "log_return",
-            "realised_vol",
-            "atr",
-            "vol_percentile",
-        ]
-    ].reset_index(drop=True)
-    target = dataset["target_return"].rename("excess_return").reset_index(drop=True)
-    if return_metadata:
-        metadata = dataset[["timestamp", "symbol"]].reset_index(drop=True)
-        return features, target, metadata
-    return features, target
+    features = dataset.loc[:, feature_columns].reset_index(drop=True)
+    target = dataset["future_log_return"].rename("future_log_return").reset_index(drop=True)
+    metadata = dataset.loc[:, ["timestamp", "symbol", "timeframe"]].reset_index(drop=True)
+    return FeatureDataset(features=features, target=target, metadata=metadata)
 
 
 class AlpacaMarketDataStore:
@@ -410,7 +542,10 @@ class AlpacaMarketDataStore:
                     request_kwargs["feed"] = _resolve_enum_member(DataFeed, selected_feed)
                 selected_adjustment = adjustment or self.adjustment
                 if selected_adjustment:
-                    request_kwargs["adjustment"] = _resolve_enum_member(Adjustment, selected_adjustment)
+                    request_kwargs["adjustment"] = _resolve_enum_member(
+                        Adjustment,
+                        selected_adjustment,
+                    )
 
                 request_params = StockBarsRequest(**request_kwargs)
             except ModuleNotFoundError:
@@ -441,9 +576,10 @@ class AlpacaMarketDataStore:
     def persist_bars(self, bars: pd.DataFrame) -> list[Path]:
         if bars.empty:
             return []
-        _validate_bars_frame(bars)
+        if "timeframe" not in bars.columns:
+            raise ValueError("Bars data is missing required column: 'timeframe'")
 
-        frame = bars.copy()
+        frame = _validate_bars_frame(bars)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         frame["year"] = frame["timestamp"].dt.year.astype(str)
         frame["month"] = frame["timestamp"].dt.month.astype(str).str.zfill(2)
@@ -461,12 +597,22 @@ class AlpacaMarketDataStore:
                 / f"month={month}"
             )
             directory.mkdir(parents=True, exist_ok=True)
+
+            partition = partition.drop(columns=["year", "month"]).reset_index(drop=True)
+            existing_paths = sorted(directory.glob("*.parquet"))
+            existing_frames = [pd.read_parquet(path) for path in existing_paths if path.exists()]
+            merged = pd.concat([partition, *existing_frames], ignore_index=True)
+            merged = _validate_bars_frame(merged)
+
             filename = (
-                f"bars_{partition['timestamp'].min():%Y%m%dT%H%M%SZ}_"
-                f"{partition['timestamp'].max():%Y%m%dT%H%M%SZ}.parquet"
+                f"bars_{merged['timestamp'].min():%Y%m%dT%H%M%SZ}_"
+                f"{merged['timestamp'].max():%Y%m%dT%H%M%SZ}.parquet"
             )
             path = directory / filename
-            partition.drop(columns=["year", "month"]).to_parquet(path, index=False)
+            merged.to_parquet(path, index=False)
+            for existing_path in existing_paths:
+                if existing_path != path and existing_path.exists():
+                    existing_path.unlink()
             written_files.append(path)
 
         return written_files
@@ -482,28 +628,30 @@ class AlpacaMarketDataStore:
         if timeframe is not None:
             resolve_timeframe(timeframe)
 
-        selected_symbols = set(symbols or [])
-        frames: list[pd.DataFrame] = []
-        for parquet_path in self.storage_root.rglob("*.parquet"):
-            parts = {part.split("=", 1)[0]: part.split("=", 1)[1] for part in parquet_path.parts if "=" in part}
-            path_symbol = parts.get("symbol")
-            path_timeframe = parts.get("timeframe")
-            if selected_symbols and path_symbol not in selected_symbols:
-                continue
-            if timeframe is not None and path_timeframe != timeframe:
-                continue
-            frames.append(pd.read_parquet(parquet_path))
-
-        if not frames:
+        paths = _candidate_parquet_paths(
+            self.storage_root,
+            symbols=symbols,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        )
+        if not paths:
             return _empty_bars_frame(timeframe or "1Day")
 
+        frames: list[pd.DataFrame] = []
+        for parquet_path in paths:
+            frame = pd.read_parquet(parquet_path)
+            frame = _validate_bars_frame(frame)
+            frames.append(frame)
+
         frame = pd.concat(frames, ignore_index=True)
-        _validate_bars_frame(frame)
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         if start is not None:
             frame = frame[frame["timestamp"] >= _normalize_datetime(start)]
         if end is not None:
             frame = frame[frame["timestamp"] <= _normalize_datetime(end)]
+
+        if frame.empty:
+            return _empty_bars_frame(timeframe or "1Day")
 
         return (
             frame.sort_values(["symbol", "timestamp"])

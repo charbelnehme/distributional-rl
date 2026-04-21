@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,19 +11,14 @@ import numpy as np
 import optuna
 import pandas as pd
 
-from src.data import AlpacaMarketDataStore, build_feature_dataset
+from src.data import AlpacaMarketDataStore, FeatureDataset, build_feature_dataset
 from src.evaluation import summarize_backtest
 
 DistributionalStrategy = None
 
 PENALTY_SCORE = -1e9
 
-
-@dataclass(frozen=True)
-class TrainingDataset:
-    features: pd.DataFrame
-    target: pd.Series
-    metadata: pd.DataFrame
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -77,8 +73,7 @@ def load_training_data(
     end: datetime,
     storage_root: Path,
     download: bool,
-    return_metadata: bool = False,
-) -> tuple[pd.DataFrame, pd.Series] | TrainingDataset:
+) -> FeatureDataset:
     store = AlpacaMarketDataStore(storage_root=storage_root)
 
     if download:
@@ -103,13 +98,10 @@ def load_training_data(
             "with --download."
         )
 
-    X, y, metadata = build_feature_dataset(bars, return_metadata=True)
-    if X.empty or len(X) < 10:
+    dataset = build_feature_dataset(bars)
+    if len(dataset) < 10:
         raise ValueError("Not enough feature rows were produced to run optimization.")
-
-    if return_metadata:
-        return TrainingDataset(features=X, target=y, metadata=metadata)
-    return X, y
+    return dataset
 
 
 def _build_walk_forward_folds(
@@ -236,7 +228,7 @@ def _objective_summary(folds: list[FoldMetrics], failures: int, nan_scores: int)
     }
 
 
-def make_objective(dataset: TrainingDataset, config: OptimizationConfig):
+def make_objective(dataset: FeatureDataset, config: OptimizationConfig):
     validation_folds = _build_walk_forward_folds(dataset.metadata, config.validation)
 
     def objective(trial: optuna.Trial) -> float:
@@ -343,7 +335,7 @@ def persist_study_artifacts(
     *,
     study: optuna.Study,
     config: OptimizationConfig,
-    dataset: TrainingDataset,
+    dataset: FeatureDataset,
 ) -> dict[str, Path]:
     config.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -389,7 +381,7 @@ def persist_study_artifacts(
     }
 
 
-def run_optimization(dataset: TrainingDataset, config: OptimizationConfig) -> optuna.Study:
+def run_optimization(dataset: FeatureDataset, config: OptimizationConfig) -> optuna.Study:
     sampler = optuna.samplers.TPESampler(seed=config.seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.set_user_attr("seed", config.seed)
