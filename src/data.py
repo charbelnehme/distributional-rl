@@ -22,6 +22,19 @@ _TIMEFRAME_CONFIG: dict[str, tuple[int, str, timedelta]] = {
     "1Day": (1, "Day", timedelta(days=730)),
 }
 
+_BAR_COLUMNS = [
+    "symbol",
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trade_count",
+    "vwap",
+    "timeframe",
+]
+
 
 class HistoricalBarsClientProtocol(Protocol):
     def get_stock_bars(self, request_params: object) -> object:
@@ -67,6 +80,7 @@ def _normalize_datetime(value: datetime) -> datetime:
 
 
 def resolve_timeframe(timeframe: str) -> str:
+    timeframe = timeframe.strip()
     if timeframe not in _TIMEFRAME_CONFIG:
         supported = ", ".join(sorted(_TIMEFRAME_CONFIG))
         raise ValueError(
@@ -106,19 +120,31 @@ def _iter_request_windows(
 
 def _empty_bars_frame(timeframe: str) -> pd.DataFrame:
     return pd.DataFrame(
-        columns=[
-            "symbol",
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "trade_count",
-            "vwap",
-            "timeframe",
-        ]
+        columns=_BAR_COLUMNS
     ).assign(timeframe=timeframe)
+
+
+def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
+    normalized = []
+    for symbol in symbols:
+        value = str(symbol).strip()
+        if value and value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("At least one symbol is required.")
+    return normalized
+
+
+def _validate_positive_integer(name: str, value: int) -> None:
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1.")
+
+
+def _validate_bars_frame(bars: pd.DataFrame) -> None:
+    required_columns = {"symbol", "timestamp", "open", "high", "low", "close", "volume", "timeframe"}
+    missing = required_columns.difference(bars.columns)
+    if missing:
+        raise ValueError(f"Bars data is missing required columns: {sorted(missing)}")
 
 
 def _bars_to_dataframe(response: object, timeframe: str) -> pd.DataFrame:
@@ -223,8 +249,10 @@ def build_feature_dataset(
     missing = required_columns.difference(bars.columns)
     if missing:
         raise ValueError(f"Bars data is missing required columns: {sorted(missing)}")
-    if return_horizon < 1:
-        raise ValueError("return_horizon must be >= 1.")
+    _validate_positive_integer("return_horizon", return_horizon)
+    _validate_positive_integer("volatility_window", volatility_window)
+    _validate_positive_integer("atr_window", atr_window)
+    _validate_positive_integer("volume_window", volume_window)
 
     frame = bars.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
@@ -357,8 +385,7 @@ class AlpacaMarketDataStore:
         persist: bool = True,
     ) -> pd.DataFrame:
         resolve_timeframe(timeframe)
-        if not symbols:
-            raise ValueError("At least one symbol is required.")
+        normalized_symbols = _normalize_symbols(symbols)
 
         start_utc = _normalize_datetime(start)
         end_utc = _normalize_datetime(end)
@@ -369,7 +396,7 @@ class AlpacaMarketDataStore:
         frames: list[pd.DataFrame] = []
         for window_start, window_end in _iter_request_windows(start_utc, end_utc, timeframe):
             request_kwargs: dict[str, Any] = {
-                "symbol_or_symbols": list(symbols),
+                "symbol_or_symbols": normalized_symbols,
                 "start": window_start,
                 "end": window_end,
             }
@@ -414,6 +441,7 @@ class AlpacaMarketDataStore:
     def persist_bars(self, bars: pd.DataFrame) -> list[Path]:
         if bars.empty:
             return []
+        _validate_bars_frame(bars)
 
         frame = bars.copy()
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
@@ -470,6 +498,7 @@ class AlpacaMarketDataStore:
             return _empty_bars_frame(timeframe or "1Day")
 
         frame = pd.concat(frames, ignore_index=True)
+        _validate_bars_frame(frame)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         if start is not None:
             frame = frame[frame["timestamp"] >= _normalize_datetime(start)]

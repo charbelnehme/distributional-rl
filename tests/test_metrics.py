@@ -28,5 +28,15 @@ class TestMetrics(unittest.TestCase):
         self.assertIsInstance(sortino_ratio(returns), float)
         self.assertLessEqual(max_drawdown(returns), 0.0)
 
+    def test_empty_and_constant_returns(self):
+        self.assertEqual(sharpe_ratio([]), 0.0)
+        self.assertEqual(sortino_ratio([]), 0.0)
+        self.assertEqual(adjusted_sharpe_ratio([]), 0.0)
+        self.assertEqual(max_drawdown([]), 0.0)
+
+        flat = np.array([0.01, 0.01, 0.01, 0.01])
+        self.assertEqual(sharpe_ratio(flat), 0.0)
+        self.assertEqual(sortino_ratio(flat), 0.0)
+
 if __name__ == '__main__':
     unittest.main()

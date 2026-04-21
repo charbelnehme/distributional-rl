@@ -45,6 +45,11 @@ class TestData(unittest.TestCase):
             loaded = store.load_stock_bars(symbols=["AAPL"], timeframe="1Min")
             self.assertEqual(len(loaded), 20)
             self.assertIn("close", loaded.columns)
+            request = client.calls[0]
+            symbols = getattr(request, "symbol_or_symbols", None)
+            if symbols is None and isinstance(request, dict):
+                symbols = request["symbol_or_symbols"]
+            self.assertEqual(list(symbols), ["AAPL"])
 
     def test_build_feature_dataset(self):
         bars = make_sample_bars(periods=40)
@@ -63,6 +68,24 @@ class TestData(unittest.TestCase):
             ["bar_portion", "log_return", "realised_vol", "atr", "vol_percentile"],
         )
         self.assertEqual(y.name, "excess_return")
+
+    def test_build_feature_dataset_rejects_non_positive_windows(self):
+        bars = make_sample_bars(periods=40)
+
+        with self.assertRaises(ValueError):
+            build_feature_dataset(bars, return_horizon=0)
+
+        with self.assertRaises(ValueError):
+            build_feature_dataset(bars, volatility_window=0)
+
+    def test_persist_bars_validates_required_columns(self):
+        bars = make_sample_bars(periods=5).drop(columns=["timeframe"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = AlpacaMarketDataStore(storage_root=tmpdir)
+
+            with self.assertRaises(ValueError):
+                store.persist_bars(bars)
 
 
 if __name__ == "__main__":

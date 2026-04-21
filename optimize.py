@@ -11,7 +11,7 @@ import optuna
 import pandas as pd
 
 from src.data import AlpacaMarketDataStore, build_feature_dataset
-from src.metrics import adjusted_sharpe_ratio, max_drawdown
+from src.evaluation import summarize_backtest
 
 DistributionalStrategy = None
 
@@ -112,17 +112,6 @@ def load_training_data(
     return X, y
 
 
-def _score_returns(portfolio_returns: np.ndarray) -> dict[str, float]:
-    mean_return = float(np.mean(portfolio_returns))
-    adjusted_sharpe = float(adjusted_sharpe_ratio(portfolio_returns))
-    drawdown = float(max_drawdown(portfolio_returns))
-    return {
-        "adjusted_sharpe": adjusted_sharpe,
-        "mean_return": mean_return,
-        "max_drawdown": drawdown,
-    }
-
-
 def _build_walk_forward_folds(
     metadata: pd.DataFrame,
     validation: ValidationConfig,
@@ -194,26 +183,27 @@ def _evaluate_fold(
     )
     strategy.fit(X_train, y_train)
     positions = np.asarray(strategy.predict_positions(X_val), dtype=float)
-    portfolio_returns = positions * y_val.to_numpy(dtype=float)
-    score_components = _score_returns(portfolio_returns)
-    turnover = _fold_turnover(positions)
-    average_leverage = float(np.mean(np.abs(positions))) if positions.size else 0.0
+    score_components = summarize_backtest(
+        y_val.to_numpy(dtype=float),
+        positions,
+        transaction_cost=0.0,
+    )
     score = float(
-        score_components["adjusted_sharpe"]
+        score_components["adjusted_sharpe_ratio"]
         + score_components["mean_return"]
         + 0.5 * score_components["max_drawdown"]
-        - 0.05 * turnover
-        - 0.01 * average_leverage
+        - 0.05 * score_components["turnover"]
+        - 0.01 * score_components["average_leverage"]
     )
     return FoldMetrics(
         fold_index=fold_index,
         train_rows=len(X_train),
         validation_rows=len(X_val),
-        adjusted_sharpe=score_components["adjusted_sharpe"],
+        adjusted_sharpe=score_components["adjusted_sharpe_ratio"],
         mean_return=score_components["mean_return"],
         max_drawdown=score_components["max_drawdown"],
-        turnover=turnover,
-        average_leverage=average_leverage,
+        turnover=score_components["turnover"],
+        average_leverage=score_components["average_leverage"],
         score=score,
     )
 
