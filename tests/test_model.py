@@ -1,5 +1,7 @@
 import unittest
 
+import numpy as np
+
 from src.model import DistributionalModel
 from tests.fixtures import make_training_frame
 
@@ -15,6 +17,16 @@ class TestModel(unittest.TestCase):
         self.assertEqual(sample.shape, (1, len(X)))
         self.assertTrue(hasattr(dists, "loc"))
         self.assertTrue(hasattr(dists, "scale"))
+
+    def test_student_t_fit_predict(self):
+        X, y = make_training_frame(periods=80)
+        model = DistributionalModel(n_estimators=10, dist_name="StudentT")
+        model.fit(X, y)
+
+        dists = model.predict_dist(X)
+        sample = dists.sample(1)
+        self.assertEqual(sample.shape, (1, len(X)))
+        self.assertTrue(np.isfinite(sample).all())
 
 
 if __name__ == "__main__":
