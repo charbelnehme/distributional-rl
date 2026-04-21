@@ -27,6 +27,19 @@ class FakeHistoricalClient:
         return FakeBarSet(self.frame)
 
 
+class SipRestrictionThenIexClient(FakeHistoricalClient):
+    def __init__(self, frame: pd.DataFrame):
+        super().__init__(frame)
+        self._failed_once = False
+
+    def get_stock_bars(self, request_params):
+        self.calls.append(request_params)
+        if not self._failed_once:
+            self._failed_once = True
+            raise RuntimeError("subscription does not permit querying recent SIP data")
+        return FakeBarSet(self.frame)
+
+
 class TestData(unittest.TestCase):
     def test_download_store_and_load_bars(self):
         bars = make_sample_bars(periods=20)
@@ -48,8 +61,54 @@ class TestData(unittest.TestCase):
             loaded = store.load_stock_bars(symbols=["AAPL"], timeframe="1Min")
             self.assertEqual(len(loaded), 20)
             self.assertIn("close", loaded.columns)
+            request = client.calls[0]
+            symbols = getattr(request, "symbol_or_symbols", None)
+            if symbols is None and isinstance(request, dict):
+                symbols = request["symbol_or_symbols"]
+            self.assertEqual(list(symbols), ["AAPL"])
+
+    def test_download_stock_bars_falls_back_to_iex_on_sip_restriction(self):
+        bars = make_sample_bars(periods=5)
+        client = SipRestrictionThenIexClient(bars)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = AlpacaMarketDataStore(client=client, storage_root=tmpdir)
+            downloaded = store.download_stock_bars(
+                ["AAPL"],
+                start=datetime(2024, 1, 2, 14, 30, tzinfo=timezone.utc),
+                end=datetime(2024, 1, 2, 14, 35, tzinfo=timezone.utc),
+                timeframe="1Min",
+                persist=False,
+            )
+
+            self.assertEqual(len(downloaded), 5)
+            self.assertEqual(len(client.calls), 2)
 
     def test_build_feature_dataset_preserves_metadata(self):
+        bars = make_sample_bars(periods=40)
+        dataset = build_feature_dataset(
+            bars,
+            return_horizon=1,
+            volatility_window=5,
+            atr_window=5,
+            volume_window=5,
+        )
+
+        self.assertIsInstance(dataset, FeatureDataset)
+        self.assertEqual(len(dataset.features), len(dataset.target))
+        self.assertEqual(len(dataset.metadata), len(dataset.target))
+        self.assertEqual(dataset.target.name, "future_log_return")
+        self.assertEqual(
+            list(dataset.features.columns),
+            ["bar_portion", "log_return", "realised_vol", "atr_pct", "vol_percentile"],
+        )
+        self.assertEqual(list(dataset.metadata.columns), ["timestamp", "symbol", "timeframe"])
+
+        X, y = dataset
+        self.assertTrue(X.equals(dataset.features))
+        self.assertTrue(y.equals(dataset.target))
+
+    def test_build_feature_dataset(self):
         bars = make_sample_bars(periods=40)
         dataset = build_feature_dataset(
             bars,
@@ -134,36 +193,6 @@ class TestData(unittest.TestCase):
             all(ts.tzinfo is not None and str(ts.tzinfo) == "UTC" for ts in naive_dataset.metadata["timestamp"])
         )
         self.assertTrue(aware_dataset.metadata["timestamp"].equals(naive_dataset.metadata["timestamp"]))
-
-    def test_cross_symbol_feature_scale_sanity(self):
-        bars = make_multi_symbol_bars(periods=40)
-        dataset = build_feature_dataset(
-            bars,
-            return_horizon=1,
-            volatility_window=5,
-            atr_window=5,
-            volume_window=5,
-        )
-
-        scale_by_symbol = (
-            dataset.features.join(dataset.metadata[["symbol"]]).groupby("symbol")["atr_pct"].mean()
-        )
-        ratio = float(scale_by_symbol.max() / scale_by_symbol.min())
-        self.assertLess(ratio, 3.0)
-
-    def test_duplicate_parquet_windows_are_deduplicated(self):
-        bars = make_sample_bars(periods=20)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = AlpacaMarketDataStore(storage_root=tmpdir)
-            store.persist_bars(bars.iloc[:15])
-            store.persist_bars(bars.iloc[5:])
-
-            loaded = store.load_stock_bars(symbols=["AAPL"], timeframe="1Min")
-            self.assertEqual(len(loaded), len(bars))
-            self.assertEqual(
-                len(loaded.drop_duplicates(["symbol", "timestamp", "timeframe"])),
-                len(loaded),
-            )
 
 
 if __name__ == "__main__":

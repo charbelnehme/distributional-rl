@@ -1,6 +1,7 @@
 """Public package surface for src."""
 
 from .data import AlpacaMarketDataStore, FeatureDataset, build_feature_dataset
+from .evaluation import backtest_portfolio, calibration_summary, summarize_backtest
 from .metrics import (
     ReturnKind,
     adjusted_sharpe_ratio,
@@ -9,7 +10,7 @@ from .metrics import (
     sortino_ratio,
 )
 from .model import DistributionalModel, DistributionalModelConfig
-from .strategy import DistributionalStrategy, find_optimal_position
+from .strategy import DistributionalStrategy, find_optimal_position, position_score
 
 __all__ = [
     "AlpacaMarketDataStore",
@@ -17,11 +18,15 @@ __all__ = [
     "DistributionalModel",
     "DistributionalStrategy",
     "FeatureDataset",
+    "ReturnKind",
     "adjusted_sharpe_ratio",
+    "backtest_portfolio",
     "build_feature_dataset",
+    "calibration_summary",
     "find_optimal_position",
     "max_drawdown",
-    "ReturnKind",
+    "position_score",
     "sharpe_ratio",
     "sortino_ratio",
+    "summarize_backtest",
 ]

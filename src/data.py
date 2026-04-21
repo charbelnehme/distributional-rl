@@ -23,8 +23,26 @@ _TIMEFRAME_CONFIG: dict[str, tuple[int, str, timedelta]] = {
     "1Day": (1, "Day", timedelta(days=730)),
 }
 
+_BAR_COLUMNS = [
+    "symbol",
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "trade_count",
+    "vwap",
+    "timeframe",
+]
+
 _BAR_FILENAME_RE = re.compile(
     r"^bars_(?P<start>\d{8}T\d{6}Z)_(?P<end>\d{8}T\d{6}Z)\.parquet$"
+)
+
+_SIP_RESTRICTION_PATTERNS = (
+    re.compile(r"subscription does not permit querying recent SIP data", re.IGNORECASE),
+    re.compile(r"SIP data", re.IGNORECASE),
 )
 
 
@@ -112,6 +130,7 @@ def _normalize_datetime(value: datetime) -> datetime:
 
 
 def resolve_timeframe(timeframe: str) -> str:
+    timeframe = timeframe.strip()
     if timeframe not in _TIMEFRAME_CONFIG:
         supported = ", ".join(sorted(_TIMEFRAME_CONFIG))
         raise ValueError(
@@ -151,19 +170,19 @@ def _iter_request_windows(
 
 def _empty_bars_frame(timeframe: str) -> pd.DataFrame:
     return pd.DataFrame(
-        columns=[
-            "symbol",
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "trade_count",
-            "vwap",
-            "timeframe",
-        ]
+        columns=_BAR_COLUMNS
     ).assign(timeframe=timeframe)
+
+
+def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
+    normalized = []
+    for symbol in symbols:
+        value = str(symbol).strip()
+        if value and value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("At least one symbol is required.")
+    return normalized
 
 
 def _bars_to_dataframe(response: object, timeframe: str) -> pd.DataFrame:
@@ -366,6 +385,11 @@ def _candidate_parquet_paths(
     return sorted(set(paths))
 
 
+def _is_sip_restriction_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(pattern.search(message) for pattern in _SIP_RESTRICTION_PATTERNS)
+
+
 def build_feature_dataset(
     bars: pd.DataFrame,
     *,
@@ -491,6 +515,37 @@ class AlpacaMarketDataStore:
         )
         return self.client
 
+    def _request_stock_bars(
+        self,
+        client: HistoricalBarsClientProtocol,
+        request_params: object,
+        *,
+        selected_feed: Optional[str],
+        allow_fallback: bool,
+    ) -> object:
+        try:
+            return client.get_stock_bars(request_params)
+        except Exception as exc:
+            if not allow_fallback or selected_feed is not None or not _is_sip_restriction_error(exc):
+                raise
+
+            _, StockBarsRequest, _, _, enums = _import_alpaca_market_data()
+            DataFeed, Adjustment = enums
+
+            fallback_kwargs = dict(request_params.to_request_fields())
+            if "symbols" in fallback_kwargs and "symbol_or_symbols" not in fallback_kwargs:
+                fallback_kwargs["symbol_or_symbols"] = fallback_kwargs.pop("symbols")
+            fallback_kwargs["feed"] = _resolve_enum_member(DataFeed, "iex")
+
+            if "adjustment" in fallback_kwargs and fallback_kwargs["adjustment"] is not None:
+                fallback_kwargs["adjustment"] = _resolve_enum_member(
+                    Adjustment,
+                    str(fallback_kwargs["adjustment"]),
+                )
+
+            fallback_request = StockBarsRequest(**fallback_kwargs)
+            return client.get_stock_bars(fallback_request)
+
     def download_stock_bars(
         self,
         symbols: Sequence[str],
@@ -503,8 +558,8 @@ class AlpacaMarketDataStore:
         persist: bool = True,
     ) -> pd.DataFrame:
         resolve_timeframe(timeframe)
-        if not symbols:
-            raise ValueError("At least one symbol is required.")
+        normalized_symbols = _normalize_symbols(symbols)
+        effective_feed = feed or self.feed or os.getenv("ALPACA_DATA_FEED")
 
         start_utc = _normalize_datetime(start)
         end_utc = _normalize_datetime(end)
@@ -515,7 +570,7 @@ class AlpacaMarketDataStore:
         frames: list[pd.DataFrame] = []
         for window_start, window_end in _iter_request_windows(start_utc, end_utc, timeframe):
             request_kwargs: dict[str, Any] = {
-                "symbol_or_symbols": list(symbols),
+                "symbol_or_symbols": normalized_symbols,
                 "start": window_start,
                 "end": window_end,
             }
@@ -524,7 +579,7 @@ class AlpacaMarketDataStore:
                 DataFeed, Adjustment = enums
                 request_kwargs["timeframe"] = _alpaca_timeframe(timeframe)
 
-                selected_feed = feed or self.feed
+                selected_feed = effective_feed
                 if selected_feed:
                     request_kwargs["feed"] = _resolve_enum_member(DataFeed, selected_feed)
                 selected_adjustment = adjustment or self.adjustment
@@ -541,7 +596,12 @@ class AlpacaMarketDataStore:
                 request_kwargs["timeframe"] = timeframe
                 request_params = request_kwargs
 
-            response = client.get_stock_bars(request_params)
+            response = self._request_stock_bars(
+                client,
+                request_params,
+                selected_feed=selected_feed,
+                allow_fallback=feed is None and self.feed is None,
+            )
             frame = _bars_to_dataframe(response, timeframe)
             if not frame.empty:
                 frames.append(frame)
@@ -563,6 +623,8 @@ class AlpacaMarketDataStore:
     def persist_bars(self, bars: pd.DataFrame) -> list[Path]:
         if bars.empty:
             return []
+        if "timeframe" not in bars.columns:
+            raise ValueError("Bars data is missing required column: 'timeframe'")
 
         frame = _validate_bars_frame(bars)
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)

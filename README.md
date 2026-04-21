@@ -2,8 +2,9 @@
 
 `distributional-rl` is a small research package for pulling historical bars
 from Alpaca, persisting them as partitioned parquet files, building modeling
-features, fitting an NGBoost-based distributional return model, and converting
-predicted return distributions into position sizes.
+features, fitting an NGBoost-based distributional return model, converting
+predicted return distributions into position sizes, and evaluating the result
+with research metrics.
 
 ## Scope of this repository
 
@@ -15,6 +16,7 @@ This checkout contains:
 - an NGBoost-backed `DistributionalModel`
 - implemented risk metrics
 - a distributional position-sizing strategy
+- backtest and calibration helpers for research analysis
 - unit tests for the above
 
 ## Installation
@@ -45,7 +47,13 @@ python3 -m pytest -q
 ```python
 from datetime import datetime, timezone
 
-from src import AlpacaMarketDataStore, DistributionalStrategy, build_feature_dataset
+from src import (
+    AlpacaMarketDataStore,
+    DistributionalStrategy,
+    backtest_portfolio,
+    build_feature_dataset,
+    summarize_backtest,
+)
 
 store = AlpacaMarketDataStore()
 bars = store.download_stock_bars(
@@ -63,6 +71,10 @@ strategy = DistributionalStrategy(
 strategy.fit(X, y)
 positions = strategy.predict_positions(X.tail(5))
 print(positions)
+
+results = backtest_portfolio(y.tail(5).to_numpy(), positions)
+print(results)
+print(summarize_backtest(y.tail(5).to_numpy(), positions))
 ```
 
 ## Project layout
@@ -71,4 +83,5 @@ print(positions)
 - `src/model.py`: NGBoost model wrapper
 - `src/metrics.py`: risk metric calculation
 - `src/strategy.py`: position sizing logic
+- `src/evaluation.py`: backtest and calibration helpers
 - `tests/`: unit tests

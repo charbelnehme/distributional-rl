@@ -18,6 +18,14 @@ class MockDist:
 
 
 class TestStrategy(unittest.TestCase):
+    def test_empty_positions_short_circuit(self):
+        X, y = make_training_frame(periods=20)
+        strategy = DistributionalStrategy(model_params={"n_estimators": 5})
+        strategy.fit(X, y)
+
+        empty = strategy.predict_positions(X.iloc[0:0])
+        self.assertEqual(empty.shape, (0,))
+
     def test_find_optimal_position(self):
         positive_dist = MockDist(0.05, 0.01)
         positive_position = find_optimal_position(
@@ -75,6 +83,10 @@ class TestStrategy(unittest.TestCase):
             find_optimal_position(dist, grid_points=[], n_samples=1000)
         with self.assertRaises(ValueError):
             find_optimal_position(dist, grid_points=[-1, 0, 1], n_samples=1000)
+
+    def test_find_optimal_position_rejects_empty_grid(self):
+        with self.assertRaises(ValueError):
+            find_optimal_position(MockDist(0.0, 0.01), grid_points=[], n_samples=10)
 
     def test_strategy_end_to_end(self):
         X, y = make_training_frame(periods=80)
